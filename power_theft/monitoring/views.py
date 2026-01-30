@@ -207,6 +207,10 @@ class PredictTheft(APIView):
     def post(self, request):
         try:
             import json
+            import pickle
+            import os
+            from django.conf import settings
+            
             data = request.data
             
             # Validate required fields
@@ -215,58 +219,115 @@ class PredictTheft(APIView):
                 if field not in data:
                     return Response({'error': f'Missing required field: {field}'}, status=400)
             
-            # Calculate loss ratio directly
-            energy_supplied = float(data['energy_supplied_kwh'])
-            energy_consumed = float(data['energy_consumed_kwh'])
-            loss_ratio = (energy_supplied - energy_consumed) / energy_supplied if energy_supplied > 0 else 0
+            # Try to load trained model
+            model_path = os.path.join(settings.BASE_DIR, 'model.pkl')
+            scaler_path = os.path.join(settings.BASE_DIR, 'scaler.pkl')
             
-            # Account for legitimate technical losses (5-10% is normal)
-            technical_losses = 0.08  # 8% baseline technical losses
-            excess_loss = max(0, loss_ratio - technical_losses)
-            
-            # Simple time features
-            timestamp = pd.to_datetime(data['timestamp'])
-            hour = timestamp.hour
-            weekday = timestamp.weekday
-            is_peak_hour = 1 if 18 <= hour <= 22 else 0
-            
-            # More realistic theft detection logic
-            if loss_ratio <= 0.10:  # <= 10% loss = Normal
-                theft_probability = 0.0
-                theft_detected = False
-            elif loss_ratio <= 0.15:  # 10-15% loss = Monitor
-                theft_probability = excess_loss * 3  # Scale excess loss
-                theft_detected = False
-            elif loss_ratio <= 0.25:  # 15-25% loss = Suspicious
-                theft_probability = 0.3 + (excess_loss * 4)
-                theft_detected = theft_probability > 0.5
-            else:  # > 25% loss = High probability of theft
-                theft_probability = min(0.7 + (excess_loss * 2), 1.0)
-                theft_detected = True
-            
-            # Additional risk factors
-            if is_peak_hour and loss_ratio > 0.12:
-                theft_probability += 0.1  # Higher losses during peak hours are more suspicious
-            
-            theft_probability = min(theft_probability, 1.0)
-            theft_detected = theft_probability > 0.6  # Higher threshold for detection
-            
-            return Response({
-                'transformer_id': data['transformer_id'],
-                'timestamp': data['timestamp'],
-                'theft_probability': round(theft_probability, 3),
-                'theft_detected': theft_detected,
-                'loss_ratio': round(loss_ratio, 4),
-                'excess_loss_ratio': round(excess_loss, 4),
-                'technical_losses_baseline': technical_losses,
-                'risk_assessment': self._get_risk_level(loss_ratio),
-                'features_used': ['loss_ratio', 'excess_loss', 'hour', 'weekday', 'is_peak_hour'],
-                'energy_supplied_kwh': energy_supplied,
-                'energy_consumed_kwh': energy_consumed
-            })
+            if os.path.exists(model_path) and os.path.exists(scaler_path):
+                # Use trained model
+                with open(model_path, 'rb') as f:
+                    model = pickle.load(f)
+                with open(scaler_path, 'rb') as f:
+                    scaler = pickle.load(f)
+                
+                # Create DataFrame for prediction
+                df_data = {
+                    'transformer_id': [data['transformer_id']],
+                    'timestamp': [pd.to_datetime(data['timestamp'])],
+                    'energy_supplied_kwh': [float(data['energy_supplied_kwh'])],
+                    'energy_consumed_kwh': [float(data['energy_consumed_kwh'])],
+                    'loss_ratio': [(float(data['energy_supplied_kwh']) - float(data['energy_consumed_kwh'])) / float(data['energy_supplied_kwh'])]
+                }
+                
+                df = pd.DataFrame(df_data)
+                df = create_features(df)
+                
+                # Use model for prediction
+                FEATURES = [
+                    "energy_supplied_kwh",
+                    "energy_consumed_kwh", 
+                    "loss_ratio",
+                    "hour",
+                    "weekday",
+                    "is_peak_hour",
+                    "loss_ratio_24h_avg",
+                    "loss_ratio_7d_avg",
+                    "supply_24h_avg"
+                ]
+                
+                X = df[FEATURES]
+                X_scaled = scaler.transform(X)
+                theft_probability = model.predict_proba(X_scaled)[0][1]
+                theft_detected = model.predict(X_scaled)[0]
+                
+                return Response({
+                    'transformer_id': data['transformer_id'],
+                    'timestamp': data['timestamp'],
+                    'theft_probability': round(theft_probability, 3),
+                    'theft_detected': bool(theft_detected),
+                    'loss_ratio': df['loss_ratio'].iloc[0],
+                    'model_used': 'trained_random_forest',
+                    'features_used': FEATURES
+                })
+            else:
+                # Fallback to rule-based logic
+                return self._rule_based_prediction(data)
             
         except Exception as e:
             return Response({'error': str(e)}, status=500)
+    
+    def _rule_based_prediction(self, data):
+        """Fallback rule-based prediction"""
+        # Calculate loss ratio directly
+        energy_supplied = float(data['energy_supplied_kwh'])
+        energy_consumed = float(data['energy_consumed_kwh'])
+        loss_ratio = (energy_supplied - energy_consumed) / energy_supplied if energy_supplied > 0 else 0
+        
+        # Account for legitimate technical losses (5-10% is normal)
+        technical_losses = 0.08  # 8% baseline technical losses
+        excess_loss = max(0, loss_ratio - technical_losses)
+        
+        # Simple time features
+        timestamp = pd.to_datetime(data['timestamp'])
+        hour = timestamp.hour
+        weekday = timestamp.weekday
+        is_peak_hour = 1 if 18 <= hour <= 22 else 0
+        
+        # More realistic theft detection logic
+        if loss_ratio <= 0.10:  # <= 10% loss = Normal
+            theft_probability = 0.0
+            theft_detected = False
+        elif loss_ratio <= 0.15:  # 10-15% loss = Monitor
+            theft_probability = excess_loss * 3  # Scale excess loss
+            theft_detected = False
+        elif loss_ratio <= 0.25:  # 15-25% loss = Suspicious
+            theft_probability = 0.3 + (excess_loss * 4)
+            theft_detected = theft_probability > 0.5
+        else:  # > 25% loss = High probability of theft
+            theft_probability = min(0.7 + (excess_loss * 2), 1.0)
+            theft_detected = True
+        
+        # Additional risk factors
+        if is_peak_hour and loss_ratio > 0.12:
+            theft_probability += 0.1  # Higher losses during peak hours are more suspicious
+        
+        theft_probability = min(theft_probability, 1.0)
+        theft_detected = theft_probability > 0.6  # Higher threshold for detection
+        
+        return Response({
+            'transformer_id': data['transformer_id'],
+            'timestamp': data['timestamp'],
+            'theft_probability': round(theft_probability, 3),
+            'theft_detected': theft_detected,
+            'loss_ratio': round(loss_ratio, 4),
+            'excess_loss_ratio': round(excess_loss, 4),
+            'technical_losses_baseline': technical_losses,
+            'risk_assessment': self._get_risk_level(loss_ratio),
+            'model_used': 'rule_based_fallback',
+            'features_used': ['loss_ratio', 'excess_loss', 'hour', 'weekday', 'is_peak_hour'],
+            'energy_supplied_kwh': energy_supplied,
+            'energy_consumed_kwh': energy_consumed
+        })
     
     def _get_risk_level(self, loss_ratio):
         """Helper method to categorize risk level"""

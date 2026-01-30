@@ -7,6 +7,9 @@ from .models_ml import random_forest_model
 from .models import Transformer, TheftPrediction
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+import pickle
+import os
+from django.conf import settings
 from sklearn.metrics import classification_report
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "power_theft.settings")
@@ -89,6 +92,20 @@ def train_and_predict():
         print(f"Saved {len(records)} predictions to database")
     else:
         print("No records to save")
+    
+    # Save the trained model
+    model_path = os.path.join(settings.BASE_DIR, 'model.pkl')
+    with open(model_path, 'wb') as f:
+        pickle.dump(model, f)
+    print(f"Model saved to {model_path}")
+    
+    # Save the scaler
+    scaler_path = os.path.join(settings.BASE_DIR, 'scaler.pkl')
+    with open(scaler_path, 'wb') as f:
+        pickle.dump(scaler, f)
+    print(f"Scaler saved to {scaler_path}")
+    
+    return model, scaler
 
 if __name__ == "__main__":
     train_and_predict()
