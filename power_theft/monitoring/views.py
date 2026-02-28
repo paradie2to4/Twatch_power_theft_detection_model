@@ -12,10 +12,12 @@ from drf_spectacular.types import OpenApiTypes
 from datetime import datetime, timedelta
 import pandas as pd
 
-from .models import Transformer, TheftPrediction
+from .models import Transformer, TheftPrediction, CashPowerMeter, PowerMeterReading, MeterTheftAlert
 from .load_data import prepare_training_data
 from .features import create_features
 from .models_ml import random_forest_model
+from .meter_features import create_meter_features, detect_meter_anomalies, calculate_theft_probability
+from .meter_train import predict_meter_theft
 from sklearn.preprocessing import StandardScaler
 
 
@@ -339,3 +341,345 @@ class PredictTheft(APIView):
             return "Suspicious"
         else:
             return "High Risk"
+
+
+# Meter-level API endpoints
+
+@api_view(['GET'])
+def meter_list(request):
+    """Get list of all power meters with their latest readings"""
+    try:
+        meters = CashPowerMeter.objects.select_related('transformer').all()
+        data = []
+        
+        for meter in meters:
+            # Get latest reading for each meter
+            latest_reading = PowerMeterReading.objects.filter(
+                meter=meter
+            ).order_by('-timestamp').first()
+            
+            # Get latest alerts
+            unresolved_alerts = MeterTheftAlert.objects.filter(
+                meter=meter,
+                is_resolved=False
+            ).count()
+            
+            meter_data = {
+                'meter_id': meter.meter_id,
+                'transformer_id': meter.transformer.transformer_id,
+                'installation_date': meter.installation_date.isoformat(),
+                'is_active': meter.is_active,
+                'unresolved_alerts': unresolved_alerts
+            }
+            
+            if latest_reading:
+                meter_data.update({
+                    'latest_reading': {
+                        'timestamp': latest_reading.timestamp.isoformat(),
+                        'energy_consumed_kwh': latest_reading.energy_consumed_kwh,
+                        'theft_detected': latest_reading.theft_detected,
+                        'theft_probability': latest_reading.theft_probability,
+                        'anomaly_detected': latest_reading.anomaly_detected
+                    }
+                })
+            
+            data.append(meter_data)
+        
+        return Response({
+            'meters': data,
+            'count': len(data)
+        })
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
+
+
+@api_view(['GET'])
+def meter_readings(request):
+    """Get readings for a specific meter"""
+    try:
+        meter_id = request.GET.get('meter_id')
+        start_date = request.GET.get('start_date')
+        end_date = request.GET.get('end_date')
+        limit = int(request.GET.get('limit', 100))
+        
+        if not meter_id:
+            return Response({'error': 'meter_id is required'}, status=400)
+        
+        queryset = PowerMeterReading.objects.filter(
+            meter__meter_id=meter_id
+        ).order_by('-timestamp')
+        
+        if start_date:
+            queryset = queryset.filter(timestamp__gte=start_date)
+        if end_date:
+            queryset = queryset.filter(timestamp__lte=end_date)
+        
+        readings = queryset[:limit]
+        
+        data = []
+        for reading in readings:
+            data.append({
+                'id': reading.id,
+                'timestamp': reading.timestamp.isoformat(),
+                'energy_consumed_kwh': reading.energy_consumed_kwh,
+                'expected_consumption_kwh': reading.expected_consumption_kwh,
+                'consumption_deviation': reading.consumption_deviation,
+                'deviation_percentage': reading.deviation_percentage,
+                'voltage_v': reading.voltage_v,
+                'current_a': reading.current_a,
+                'power_factor': reading.power_factor,
+                'anomaly_detected': reading.anomaly_detected,
+                'theft_probability': reading.theft_probability,
+                'theft_detected': reading.theft_detected,
+                'reading_source': reading.reading_source,
+                'data_quality_flag': reading.data_quality_flag
+            })
+        
+        return Response({
+            'meter_id': meter_id,
+            'readings': data,
+            'count': len(data)
+        })
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
+
+
+@extend_schema(
+    request={
+        'application/json': {
+            'type': 'object',
+            'properties': {
+                'meter_id': {'type': 'string', 'example': 'METER_001'},
+                'energy_consumed_kwh': {'type': 'number', 'example': 45.2},
+                'expected_consumption_kwh': {'type': 'number', 'example': 50.0},
+                'voltage_v': {'type': 'number', 'example': 230.5},
+                'current_a': {'type': 'number', 'example': 20.3},
+                'power_factor': {'type': 'number', 'example': 0.92},
+                'timestamp': {'type': 'string', 'format': 'date-time', 'example': '2024-01-15T10:30:00'},
+                'reading_source': {'type': 'string', 'example': 'automated'}
+            },
+            'required': ['meter_id', 'energy_consumed_kwh', 'timestamp']
+        }
+    },
+    responses={
+        200: {
+            'type': 'object',
+            'properties': {
+                'meter_id': {'type': 'string'},
+                'timestamp': {'type': 'string'},
+                'theft_probability': {'type': 'number'},
+                'theft_detected': {'type': 'boolean'},
+                'anomaly_detected': {'type': 'boolean'},
+                'consumption_deviation_pct': {'type': 'number'},
+                'risk_assessment': {'type': 'string'}
+            }
+        }
+    }
+)
+class MeterTheftDetection(APIView):
+    """Detect theft for individual power meters"""
+    
+    def post(self, request):
+        try:
+            data = request.data
+            
+            # Validate required fields
+            required_fields = ['meter_id', 'energy_consumed_kwh', 'timestamp']
+            for field in required_fields:
+                if field not in data:
+                    return Response({'error': f'Missing required field: {field}'}, status=400)
+            
+            # Get or create meter
+            try:
+                meter = CashPowerMeter.objects.get(meter_id=data['meter_id'])
+            except CashPowerMeter.DoesNotExist:
+                return Response({'error': f'Meter {data["meter_id"]} not found'}, status=404)
+            
+            # Create reading record
+            reading_data = {
+                'meter': meter,
+                'timestamp': pd.to_datetime(data['timestamp']),
+                'energy_consumed_kwh': float(data['energy_consumed_kwh']),
+                'voltage_v': float(data.get('voltage_v', 0)) if data.get('voltage_v') else None,
+                'current_a': float(data.get('current_a', 0)) if data.get('current_a') else None,
+                'power_factor': float(data.get('power_factor', 0)) if data.get('power_factor') else None,
+                'expected_consumption_kwh': float(data['expected_consumption_kwh']) if 'expected_consumption_kwh' in data else None,
+                'reading_source': data.get('reading_source', 'manual')
+            }
+            
+            # Try ML prediction first
+            try:
+                prediction_result = predict_meter_theft(data)[0]
+                reading_data.update({
+                    'theft_probability': prediction_result['theft_probability'],
+                    'theft_detected': prediction_result['theft_detected'],
+                    'anomaly_detected': prediction_result['theft_probability'] > 0.3
+                })
+                model_used = 'ml_model'
+            except:
+                # Fallback to rule-based detection
+                reading_data.update(self._rule_based_meter_detection(data))
+                model_used = 'rule_based'
+            
+            # Save reading
+            reading = PowerMeterReading.objects.create(**reading_data)
+            
+            # Create alert if theft detected
+            if reading.theft_detected:
+                self._create_theft_alert(reading)
+            
+            return Response({
+                'meter_id': data['meter_id'],
+                'timestamp': data['timestamp'],
+                'theft_probability': reading.theft_probability,
+                'theft_detected': reading.theft_detected,
+                'anomaly_detected': reading.anomaly_detected,
+                'consumption_deviation_pct': reading.deviation_percentage,
+                'model_used': model_used,
+                'reading_id': reading.id
+            })
+            
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+    
+    def _rule_based_meter_detection(self, data):
+        """Rule-based theft detection for individual meters"""
+        consumption = float(data['energy_consumed_kwh'])
+        
+        # Zero consumption check
+        if consumption <= 0.01:
+            return {
+                'theft_probability': 0.8,
+                'theft_detected': True,
+                'anomaly_detected': True
+            }
+        
+        # Deviation check if expected consumption is available
+        if 'expected_consumption_kwh' in data:
+            expected = float(data['expected_consumption_kwh'])
+            if expected > 0:
+                deviation_pct = ((expected - consumption) / expected) * 100
+                
+                if deviation_pct > 50:
+                    return {
+                        'theft_probability': min(0.7 + (deviation_pct - 50) * 0.01, 1.0),
+                        'theft_detected': True,
+                        'anomaly_detected': True
+                    }
+                elif deviation_pct > 20:
+                    return {
+                        'theft_probability': 0.3 + (deviation_pct - 20) * 0.02,
+                        'theft_detected': deviation_pct > 40,
+                        'anomaly_detected': True
+                    }
+        
+        # Electrical parameter anomalies
+        if 'voltage_v' in data and 'current_a' in data:
+            voltage = float(data['voltage_v'])
+            current = float(data['current_a'])
+            
+            if voltage < 200 or voltage > 250:
+                return {
+                    'theft_probability': 0.4,
+                    'theft_detected': False,
+                    'anomaly_detected': True
+                }
+            
+            if consumption > 0 and current < 0.1:
+                return {
+                    'theft_probability': 0.6,
+                    'theft_detected': True,
+                    'anomaly_detected': True
+                }
+        
+        return {
+            'theft_probability': 0.1,
+            'theft_detected': False,
+            'anomaly_detected': False
+        }
+    
+    def _create_theft_alert(self, reading):
+        """Create theft alert for meter"""
+        severity = 'high' if reading.theft_probability > 0.7 else 'medium'
+        
+        alert_type = 'consumption_anomaly'
+        if reading.energy_consumed_kwh <= 0.01:
+            alert_type = 'zero_consumption'
+        
+        MeterTheftAlert.objects.create(
+            meter=reading.meter,
+            reading=reading,
+            alert_type=alert_type,
+            severity=severity,
+            confidence_score=reading.theft_probability,
+            description=f"Theft detected: {alert_type} with probability {reading.theft_probability:.2f}"
+        )
+
+
+@api_view(['GET'])
+def meter_theft_alerts(request):
+    """Get theft alerts for meters"""
+    try:
+        meter_id = request.GET.get('meter_id')
+        severity = request.GET.get('severity')
+        is_resolved = request.GET.get('is_resolved')
+        limit = int(request.GET.get('limit', 50))
+        
+        queryset = MeterTheftAlert.objects.select_related('meter', 'reading').order_by('-created_at')
+        
+        if meter_id:
+            queryset = queryset.filter(meter__meter_id=meter_id)
+        if severity:
+            queryset = queryset.filter(severity=severity)
+        if is_resolved is not None:
+            queryset = queryset.filter(is_resolved=is_resolved.lower() == 'true')
+        
+        alerts = queryset[:limit]
+        
+        data = []
+        for alert in alerts:
+            data.append({
+                'id': alert.id,
+                'meter_id': alert.meter.meter_id,
+                'transformer_id': alert.meter.transformer.transformer_id,
+                'alert_type': alert.alert_type,
+                'severity': alert.severity,
+                'confidence_score': alert.confidence_score,
+                'description': alert.description,
+                'is_resolved': alert.is_resolved,
+                'resolved_at': alert.resolved_at.isoformat() if alert.resolved_at else None,
+                'resolution_notes': alert.resolution_notes,
+                'created_at': alert.created_at.isoformat(),
+                'reading_timestamp': alert.reading.timestamp.isoformat(),
+                'energy_consumed_kwh': alert.reading.energy_consumed_kwh
+            })
+        
+        return Response({
+            'alerts': data,
+            'count': len(data)
+        })
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
+
+
+@api_view(['POST'])
+def resolve_meter_alert(request, alert_id):
+    """Resolve a meter theft alert"""
+    try:
+        alert = MeterTheftAlert.objects.get(id=alert_id)
+        resolution_notes = request.data.get('resolution_notes', '')
+        
+        alert.is_resolved = True
+        alert.resolved_at = datetime.now()
+        alert.resolution_notes = resolution_notes
+        alert.save()
+        
+        return Response({
+            'message': 'Alert resolved successfully',
+            'alert_id': alert.id,
+            'resolved_at': alert.resolved_at.isoformat()
+        })
+    except MeterTheftAlert.DoesNotExist:
+        return Response({'error': 'Alert not found'}, status=404)
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
