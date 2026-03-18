@@ -77,22 +77,30 @@ WSGI_APPLICATION = 'power_theft.wsgi.application'
 
 import os
 
-if 'DATABASE_URL' in os.environ:
-    # Production (Render) database
+# Database selection precedence:
+# - DATABASE_URL: production-style configuration (Render / container / etc)
+# - USE_SQLITE=1: quick local dev without Postgres
+# - otherwise: local Postgres defaults
+if "DATABASE_URL" in os.environ:
     import dj_database_url
+
+    DATABASES = {"default": dj_database_url.parse(os.environ["DATABASE_URL"])}
+elif os.environ.get("USE_SQLITE", "").strip() in {"1", "true", "True", "yes", "YES"}:
     DATABASES = {
-        'default': dj_database_url.parse(os.environ['DATABASE_URL'])
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+        }
     }
 else:
-    # Development database
     DATABASES = {
-        'default': {
-            'ENGINE': 'django.db.backends.postgresql',
-            'NAME': 'power_detection',
-            'USER': 'postgres',
-            'PASSWORD': 'mami',
-            'HOST': 'localhost',
-            'PORT': '5432',
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": "power_detection",
+            "USER": "postgres",
+            "PASSWORD": "mami",
+            "HOST": "localhost",
+            "PORT": "5432",
         }
     }
 
